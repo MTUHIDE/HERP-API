@@ -84,7 +84,8 @@ function herp_get_user_records(WP_REST_Request $request) {
     // Attach vouchers (ACF field on the WP `record` post).
     foreach ($records as $record) {
         $post_id = intval($record->post_id ?? 0);
-        $record->vouchers = herp_get_record_vouchers($post_id);
+        $record_id = intval($record->r_id ?? 0);
+        $record->vouchers = herp_get_record_vouchers($post_id, $record_id);
     }
 
     return $records;
@@ -95,35 +96,51 @@ function herp_get_user_records(WP_REST_Request $request) {
  *
  * @return array<int, array<string, mixed>>
  */
-function herp_get_record_vouchers(int $post_id): array {
+function herp_get_record_vouchers(int $post_id, int $record_id = 0): array {
     if ($post_id <= 0) {
         return [];
     }
 
+    $attachment_ids = [];
+
     if (!function_exists('get_field')) {
-        return [];
+        // Fallback to legacy voucher table if ACF isn't available.
+        return herp_get_record_vouchers_from_legacy_table($record_id);
     }
 
     $raw = get_field('vouchers', $post_id);
-    if (empty($raw) || !is_array($raw)) {
+    if (!empty($raw) && is_array($raw)) {
+        foreach ($raw as $voucher) {
+            $attachment_id = 0;
+
+            if (is_numeric($voucher)) {
+                $attachment_id = intval($voucher);
+            } elseif (is_array($voucher)) {
+                $attachment_id = intval($voucher['ID'] ?? $voucher['id'] ?? $voucher['attachment_id'] ?? 0);
+            } elseif (is_object($voucher)) {
+                // ACF can return WP_Post objects depending on field return format.
+                $attachment_id = intval($voucher->ID ?? 0);
+            }
+
+            if ($attachment_id > 0) {
+                $attachment_ids[] = $attachment_id;
+            }
+        }
+    }
+
+    // If ACF field is empty, try legacy voucher table lookup.
+    if (empty($attachment_ids) && $record_id > 0) {
+        $attachment_ids = herp_get_record_attachment_ids_from_legacy_table($record_id);
+    }
+
+    $attachment_ids = array_values(array_unique(array_filter(array_map('intval', $attachment_ids))));
+    if (empty($attachment_ids)) {
         return [];
     }
 
     $out = [];
 
-    foreach ($raw as $voucher) {
-        $attachment_id = 0;
-
-        if (is_numeric($voucher)) {
-            $attachment_id = intval($voucher);
-        } elseif (is_array($voucher)) {
-            $attachment_id = intval($voucher['ID'] ?? $voucher['id'] ?? $voucher['attachment_id'] ?? 0);
-        }
-
-        if ($attachment_id <= 0) {
-            continue;
-        }
-
+    foreach ($attachment_ids as $attachment_id) {
         $url = wp_get_attachment_url($attachment_id) ?: '';
         $mime = get_post_mime_type($attachment_id) ?: '';
         $type = '';
@@ -182,6 +199,96 @@ function herp_get_record_vouchers(int $post_id): array {
         }
 
         $out[] = $item;
+    }
+
+    return $out;
+}
+
+/**
+ * Find attachment IDs by consulting the legacy voucher table and using the naming convention:
+ * /uploads/vouchers/{record_id}-{v_id}.ext
+ *
+ * @return int[]
+ */
+function herp_get_record_attachment_ids_from_legacy_table(int $record_id): array {
+    global $wpdb;
+
+    if ($record_id <= 0) {
+        return [];
+    }
+
+    $table = null;
+    foreach (['voucher', $wpdb->prefix . 'voucher'] as $candidate) {
+        $pattern = $wpdb->esc_like($candidate);
+        $exists = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $pattern));
+        if ($exists) {
+            $table = $candidate;
+            break;
+        }
+    }
+
+    if (!$table) {
+        return [];
+    }
+
+    $vids = $wpdb->get_col(
+        $wpdb->prepare("SELECT v_id FROM {$table} WHERE v_record = %d ORDER BY v_id ASC", $record_id)
+    );
+
+    if (empty($vids) || !is_array($vids)) {
+        return [];
+    }
+
+    $ids = [];
+    foreach ($vids as $vid) {
+        $vid = intval($vid);
+        if ($vid <= 0) {
+            continue;
+        }
+
+        $like = '%/vouchers/' . $wpdb->esc_like($record_id . '-' . $vid) . '.%';
+        $found = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT ID FROM {$wpdb->posts}
+                 WHERE post_type = 'attachment' AND guid LIKE %s
+                 ORDER BY ID DESC
+                 LIMIT 1",
+                $like
+            )
+        );
+        if ($found) {
+            $ids[] = intval($found);
+        }
+    }
+
+    return $ids;
+}
+
+/**
+ * Backwards-compatible wrapper: if you only have the legacy voucher table, return normalized vouchers.
+ *
+ * @return array<int, array<string, mixed>>
+ */
+function herp_get_record_vouchers_from_legacy_table(int $record_id): array {
+    $ids = herp_get_record_attachment_ids_from_legacy_table($record_id);
+    if (empty($ids)) {
+        return [];
+    }
+
+    // Reuse the main normalizer by pretending we have a post_id (we don't).
+    $out = [];
+    foreach ($ids as $attachment_id) {
+        $url = wp_get_attachment_url($attachment_id) ?: '';
+        $mime = get_post_mime_type($attachment_id) ?: '';
+        $type = (is_string($mime) && str_starts_with($mime, 'image/')) ? 'image' : ((is_string($mime) && str_starts_with($mime, 'audio/')) ? 'audio' : 'file');
+
+        $out[] = [
+            'id' => (int) $attachment_id,
+            'type' => $type,
+            'mime_type' => $mime,
+            'url' => $url,
+            'title' => get_the_title($attachment_id) ?: '',
+        ];
     }
 
     return $out;
