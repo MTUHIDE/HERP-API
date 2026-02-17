@@ -400,12 +400,310 @@ function herp_allocate_record_id(int $timeout_seconds = 5) {
 }
 
 /**
+ * Convert a PHP multi-upload entry into a flat list of file arrays.
+ *
+ * Expected input: $_FILES['files'] where each key (name/type/tmp_name/error/size)
+ * contains an array.
+ *
+ * @return array<int, array{name:string,type:string,tmp_name:string,error:int,size:int}>
+ */
+function herp_normalize_uploaded_files(array $files): array {
+    // REST-style: already a list of file arrays.
+    if (array_is_list($files) && isset($files[0]) && is_array($files[0]) && array_key_exists('tmp_name', $files[0])) {
+        $out = [];
+        foreach ($files as $f) {
+            if (!is_array($f)) {
+                continue;
+            }
+            $out[] = [
+                'name' => (string) ($f['name'] ?? ''),
+                'type' => (string) ($f['type'] ?? ''),
+                'tmp_name' => (string) ($f['tmp_name'] ?? ''),
+                'error' => (int) ($f['error'] ?? UPLOAD_ERR_NO_FILE),
+                'size' => (int) ($f['size'] ?? 0),
+            ];
+        }
+        return $out;
+    }
+
+    // Already normalized (single file).
+    if (!empty($files['tmp_name']) && is_string($files['tmp_name'])) {
+        return [[
+            'name' => (string) ($files['name'] ?? ''),
+            'type' => (string) ($files['type'] ?? ''),
+            'tmp_name' => (string) ($files['tmp_name'] ?? ''),
+            'error' => (int) ($files['error'] ?? UPLOAD_ERR_NO_FILE),
+            'size' => (int) ($files['size'] ?? 0),
+        ]];
+    }
+
+    $out = [];
+    $names = $files['name'] ?? [];
+    $types = $files['type'] ?? [];
+    $tmp_names = $files['tmp_name'] ?? [];
+    $errors = $files['error'] ?? [];
+    $sizes = $files['size'] ?? [];
+
+    $count = is_array($names) ? count($names) : 0;
+    for ($i = 0; $i < $count; $i++) {
+        $out[] = [
+            'name' => (string) ($names[$i] ?? ''),
+            'type' => (string) ($types[$i] ?? ''),
+            'tmp_name' => (string) ($tmp_names[$i] ?? ''),
+            'error' => (int) ($errors[$i] ?? UPLOAD_ERR_NO_FILE),
+            'size' => (int) ($sizes[$i] ?? 0),
+        ];
+    }
+
+    return $out;
+}
+
+/**
+ * Upload a single file to WP media library under /vouchers and attach to $post_id.
+ *
+ * @return int|WP_Error Attachment ID
+ */
+function herp_upload_voucher_to_media(array $file, int $post_id, ?int $actor_user_id = null) {
+    if ($post_id <= 0) {
+        return new WP_Error('invalid_post_id', 'Invalid post_id for voucher upload', ['status' => 500]);
+    }
+
+    if (($file['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+        return new WP_Error('upload_failed', 'Upload error for voucher file', ['status' => 400, 'upload_error' => $file['error'] ?? null]);
+    }
+
+    $tmp = (string) ($file['tmp_name'] ?? '');
+    if ($tmp === '' || !file_exists($tmp) || !is_readable($tmp)) {
+        return new WP_Error('invalid_upload', 'Invalid uploaded file tmp_name', ['status' => 400]);
+    }
+
+    require_once ABSPATH . 'wp-admin/includes/file.php';
+    require_once ABSPATH . 'wp-admin/includes/media.php';
+    require_once ABSPATH . 'wp-admin/includes/image.php';
+
+    $prev_user_id = get_current_user_id();
+    if ($actor_user_id !== null && $actor_user_id > 0 && $prev_user_id !== $actor_user_id) {
+        wp_set_current_user($actor_user_id);
+    }
+
+    // Store all vouchers under /vouchers (same as the theme).
+    $upload_filter = static function ($upload) {
+        $upload['subdir'] = '/vouchers';
+        $upload['path'] = $upload['basedir'] . $upload['subdir'];
+        $upload['url'] = $upload['baseurl'] . $upload['subdir'];
+        return $upload;
+    };
+    add_filter('upload_dir', $upload_filter);
+
+    try {
+        $overrides = ['test_form' => false];
+        $moved = wp_handle_upload($file, $overrides);
+
+        if (!is_array($moved) || !empty($moved['error'])) {
+            return new WP_Error('upload_move_failed', 'Could not move uploaded voucher file', ['status' => 500, 'error' => $moved['error'] ?? 'unknown']);
+        }
+
+        $file_path = $moved['file'];
+        $file_url = $moved['url'];
+        $mime_type = $moved['type'] ?? '';
+
+        $attachment = [
+            'guid' => $file_url,
+            'post_mime_type' => $mime_type,
+            'post_title' => sanitize_file_name(pathinfo($file_path, PATHINFO_FILENAME)),
+            'post_content' => '',
+            'post_status' => 'inherit',
+        ];
+
+        // If wp_posts.ID isn't auto-incrementing, force a unique ID for the attachment too.
+        $posts_has_ai = herp_wp_posts_has_auto_increment();
+        if (!$posts_has_ai) {
+            $allocated_post_id = herp_allocate_wp_post_id();
+            if (!is_wp_error($allocated_post_id)) {
+                $attachment['import_id'] = (int) $allocated_post_id;
+            }
+        }
+
+        $attach_id = wp_insert_attachment($attachment, $file_path, $post_id, true);
+        if (is_wp_error($attach_id) || !$attach_id) {
+            // Retry once with a fresh import_id.
+            $retry = $attachment;
+            $retry_alloc = herp_allocate_wp_post_id();
+            if (!is_wp_error($retry_alloc)) {
+                $retry['import_id'] = (int) $retry_alloc;
+                $attach_id = wp_insert_attachment($retry, $file_path, $post_id, true);
+            }
+
+            // Fallback: sometimes wp_insert_attachment returns 0 even though a row was inserted.
+            if (!is_wp_error($attach_id) && !$attach_id) {
+                global $wpdb;
+                $found = $wpdb->get_var(
+                    $wpdb->prepare(
+                        "SELECT ID FROM {$wpdb->posts}
+                         WHERE post_type = 'attachment' AND guid = %s
+                         ORDER BY ID DESC
+                         LIMIT 1",
+                        $file_url
+                    )
+                );
+                if ($found) {
+                    $attach_id = (int) $found;
+                }
+            }
+
+            if (is_wp_error($attach_id) || !$attach_id) {
+                global $wpdb;
+                $data = [
+                    'status' => 500,
+                    'file_path' => $file_path,
+                    'file_url' => $file_url,
+                    'mime_type' => $mime_type,
+                    'db_last_error' => $wpdb->last_error,
+                    'db_last_query' => $wpdb->last_query,
+                ];
+                if (is_wp_error($attach_id)) {
+                    $data['inner_code'] = $attach_id->get_error_code();
+                    $data['wp_error_code'] = $attach_id->get_error_code();
+                    $data['wp_error_message'] = $attach_id->get_error_message();
+                    $data['wp_error_data'] = $attach_id->get_error_data();
+                } else {
+                    $data['inner_code'] = 'wp_insert_attachment_returned_0';
+                }
+                return new WP_Error('attachment_insert_failed', 'Could not create attachment post', $data);
+            }
+        }
+
+        $attach_id = (int) $attach_id;
+
+        // Ensure the attached file meta is set (some environments skip it on weird insert flows).
+        $uploads = wp_get_upload_dir();
+        $relative = $file_path;
+        if (!empty($uploads['basedir']) && str_starts_with($file_path, $uploads['basedir'] . '/')) {
+            $relative = substr($file_path, strlen($uploads['basedir']) + 1);
+        }
+        if (is_string($relative) && $relative !== '') {
+            update_post_meta($attach_id, '_wp_attached_file', $relative);
+        }
+
+        // Generating image sizes can be very slow on local setups; attachments still work without it.
+        // If you need thumbnails later, we can re-enable this.
+
+        return $attach_id;
+    } finally {
+        remove_filter('upload_dir', $upload_filter);
+        if ($actor_user_id !== null && $actor_user_id > 0 && $prev_user_id !== $actor_user_id) {
+            wp_set_current_user($prev_user_id);
+        }
+    }
+}
+
+/**
+ * Insert a row into the legacy `voucher` table (if it exists).
+ * Maps kinds: image/video => Photo, audio => Audio.
+ */
+/**
+ * Insert a row into the legacy voucher table and return v_id.
+ *
+ * @return int|WP_Error v_id on success, 0 if voucher table missing
+ */
+function herp_insert_legacy_voucher_row(int $owner_id, int $record_id, string $file_kind) {
+    global $wpdb;
+
+    // Some installs use an un-prefixed table (`voucher`), others may use a prefixed table (`wp_voucher`).
+    $candidates = ['voucher', $wpdb->prefix . 'voucher'];
+    $table = null;
+    foreach ($candidates as $candidate) {
+        // Escape _ and % for LIKE (WordPress helper).
+        $pattern = $wpdb->esc_like($candidate);
+        $exists = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $pattern));
+        if ($exists) {
+            $table = $candidate;
+            break;
+        }
+    }
+
+    if (!$table) {
+        return 0;
+    }
+
+    $kind = strtolower(trim($file_kind));
+    $v_type = ($kind === 'audio') ? 'Audio' : 'Photo';
+
+    $extra = $wpdb->get_var(
+        $wpdb->prepare(
+            "SELECT EXTRA FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = 'v_id'
+             LIMIT 1",
+            $wpdb->dbname,
+            $table
+        )
+    );
+    $has_ai = is_string($extra) && stripos($extra, 'auto_increment') !== false;
+
+    if ($has_ai) {
+        $ok = $wpdb->insert($table, [
+            'v_owner' => $owner_id,
+            'v_record' => $record_id,
+            'v_type' => $v_type,
+        ]);
+        if ($ok === false) {
+            return new WP_Error('voucher_insert_failed', 'Could not insert voucher row', ['status' => 500, 'db_last_error' => $wpdb->last_error, 'db_last_query' => $wpdb->last_query]);
+        }
+
+        $vid = (int) $wpdb->insert_id;
+        if ($vid > 0) {
+            return $vid;
+        }
+
+        // Fallback if insert_id is not reliable.
+        $vid = (int) $wpdb->get_var(
+            $wpdb->prepare("SELECT v_id FROM {$table} WHERE v_owner = %d AND v_record = %d AND v_type = %s ORDER BY v_id DESC LIMIT 1", $owner_id, $record_id, $v_type)
+        );
+        return $vid > 0 ? $vid : 0;
+    }
+
+    $locked = $wpdb->get_var($wpdb->prepare('SELECT GET_LOCK(%s, %d)', 'herp_voucher_vid', 5));
+    if ((int) $locked !== 1) {
+        return new WP_Error('voucher_id_lock_failed', 'Could not allocate voucher id (lock timeout)', ['status' => 503]);
+    }
+
+    try {
+        $next = (int) $wpdb->get_var("SELECT COALESCE(MAX(v_id), 0) + 1 FROM {$table} WHERE v_id > 0");
+        if ($next <= 0) {
+            $next = 1;
+        }
+
+        $ok = $wpdb->insert($table, [
+            'v_id' => $next,
+            'v_owner' => $owner_id,
+            'v_record' => $record_id,
+            'v_type' => $v_type,
+        ]);
+        if ($ok === false) {
+            return new WP_Error('voucher_insert_failed', 'Could not insert voucher row', ['status' => 500, 'db_last_error' => $wpdb->last_error, 'db_last_query' => $wpdb->last_query]);
+        }
+
+        return $next;
+    } finally {
+        $wpdb->get_var($wpdb->prepare('SELECT RELEASE_LOCK(%s)', 'herp_voucher_vid'));
+    }
+}
+
+/**
  * Check whether wp_posts.ID is AUTO_INCREMENT.
  */
 function herp_wp_posts_has_auto_increment(): bool {
     global $wpdb;
 
     $posts_table = $wpdb->posts; // e.g. wp_posts
+
+    // Prefer SHOW FULL COLUMNS (works even when INFORMATION_SCHEMA is restricted).
+    $row = $wpdb->get_row("SHOW FULL COLUMNS FROM {$posts_table} LIKE 'ID'", ARRAY_A);
+    if (is_array($row) && isset($row['Extra'])) {
+        return stripos((string) $row['Extra'], 'auto_increment') !== false;
+    }
+
+    // Fallback to INFORMATION_SCHEMA; if we can't determine it, assume true.
     $extra = $wpdb->get_var(
         $wpdb->prepare(
             "SELECT EXTRA FROM INFORMATION_SCHEMA.COLUMNS
@@ -415,6 +713,10 @@ function herp_wp_posts_has_auto_increment(): bool {
             $posts_table
         )
     );
+
+    if ($extra === null) {
+        return true;
+    }
 
     return is_string($extra) && stripos($extra, 'auto_increment') !== false;
 }
@@ -463,6 +765,61 @@ function herp_allocate_wp_post_id(int $timeout_seconds = 5) {
 function herp_create_record(WP_REST_Request $request) {
     global $wpdb;
 
+    /**
+     * Your environment is printing PHP warnings into the HTTP response body,
+     * which breaks JSON parsing for the app. We suppress warning output for this
+     * endpoint and capture them for debugging instead.
+     */
+    $herp_warnings = [];
+    $herp_buffered_output = '';
+    $prev_display_errors = ini_get('display_errors');
+    @ini_set('display_errors', '0');
+    $prev_error_handler = set_error_handler(static function ($errno, $errstr, $errfile, $errline) use (&$herp_warnings) {
+        // Capture common noisy levels; let fatals still bubble.
+        $capture = [
+            E_WARNING,
+            E_NOTICE,
+            E_USER_WARNING,
+            E_USER_NOTICE,
+            E_DEPRECATED,
+            E_USER_DEPRECATED,
+        ];
+        if (!in_array($errno, $capture, true)) {
+            return false;
+        }
+
+        $trace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS);
+        $first_app_frame = null;
+        foreach ($trace as $frame) {
+            $file = $frame['file'] ?? '';
+            if (
+                is_string($file) &&
+                $file !== '' &&
+                strpos($file, DIRECTORY_SEPARATOR . 'wp-includes' . DIRECTORY_SEPARATOR) === false &&
+                strpos($file, DIRECTORY_SEPARATOR . 'wp-admin' . DIRECTORY_SEPARATOR) === false
+            ) {
+                $first_app_frame = $frame;
+                break;
+            }
+        }
+
+        $herp_warnings[] = [
+            'errno' => $errno,
+            'message' => $errstr,
+            'file' => $errfile,
+            'line' => $errline,
+            'first_app_frame' => $first_app_frame ? [
+                'file' => $first_app_frame['file'] ?? null,
+                'line' => $first_app_frame['line'] ?? null,
+                'function' => $first_app_frame['function'] ?? null,
+            ] : null,
+        ];
+
+        // Prevent PHP from printing this warning.
+        return true;
+    });
+    ob_start();
+
     $payload = $request->get_json_params();
     if (!is_array($payload) || empty($payload)) {
         $payload = $request->get_body_params();
@@ -495,7 +852,15 @@ function herp_create_record(WP_REST_Request $request) {
         $record = $payload;
     }
 
-    $animals = herp_param_to_array($payload['animals'] ?? ($payload['Animals'] ?? []));
+    $animals = $payload['animals'] ?? ($payload['Animals'] ?? []);
+    // Multipart forms often send JSON strings for nested objects.
+    if (is_string($animals) && $animals !== '') {
+        $decoded = json_decode($animals, true);
+        if (is_array($decoded)) {
+            $animals = $decoded;
+        }
+    }
+    $animals = herp_param_to_array($animals);
 
     if (empty($animals)) {
         // Allow single-animal payloads.
@@ -507,6 +872,29 @@ function herp_create_record(WP_REST_Request $request) {
 
     if (empty($animals)) {
         return new WP_Error('missing_animals', 'Missing animals array', ['status' => 400]);
+    }
+
+    // Multipart voucher uploads (from app):
+    // - files[]                 (uploaded files)
+    // - assigned_animal_index[] (0-based index into animals)
+    // - file_kind[]             ("image" | "video" | "audio")
+    //
+    // IMPORTANT: For WP REST requests, use $request->get_file_params() (more reliable than $_FILES).
+    $uploaded_files = [];
+    $file_params = $request->get_file_params();
+    if (!empty($file_params['files']) && is_array($file_params['files'])) {
+        $uploaded_files = herp_normalize_uploaded_files($file_params['files']);
+    } elseif (!empty($_FILES['files']) && is_array($_FILES['files'])) {
+        $uploaded_files = herp_normalize_uploaded_files($_FILES['files']);
+    }
+
+    $assigned_animal_index = $request->get_param('assigned_animal_index');
+    $file_kind = $request->get_param('file_kind');
+    if (!is_array($assigned_animal_index)) {
+        $assigned_animal_index = [$assigned_animal_index];
+    }
+    if (!is_array($file_kind)) {
+        $file_kind = [$file_kind];
     }
 
     // Resolve county from name (or accept numeric id).
@@ -580,7 +968,7 @@ function herp_create_record(WP_REST_Request $request) {
 
     $created = [];
 
-    foreach ($animals as $animal) {
+    foreach ($animals as $animal_idx => $animal) {
         if (!is_array($animal)) {
             continue;
         }
@@ -823,7 +1211,7 @@ function herp_create_record(WP_REST_Request $request) {
             'post_name'    => $desired_slug,
         ];
 
-        // If wp_posts.ID isn't auto-incrementing in this environment, force a unique ID via import_id.
+        // If wp_posts.ID is not AUTO_INCREMENT-ing in this environment, force a unique ID.
         if (!$posts_has_ai) {
             $allocated_post_id = herp_allocate_wp_post_id();
             if (is_wp_error($allocated_post_id)) {
@@ -848,9 +1236,11 @@ function herp_create_record(WP_REST_Request $request) {
             );
         }
 
-        // Fallback #2: if wp_posts has broken AUTO_INCREMENT and we didn't set import_id (or it still failed),
-        // try one retry with an explicit import_id.
-        if (!is_wp_error($post_id) && !$post_id && $posts_has_ai === false && empty($post_args['import_id'])) {
+        // Fallback #2: retry once with a forced ID.
+        if (
+            (is_wp_error($post_id) && $post_id->get_error_code() === 'db_insert_error') ||
+            (!is_wp_error($post_id) && !$post_id)
+        ) {
             $allocated_post_id = herp_allocate_wp_post_id();
             if (!is_wp_error($allocated_post_id)) {
                 $post_args['import_id'] = (int) $allocated_post_id;
@@ -881,6 +1271,7 @@ function herp_create_record(WP_REST_Request $request) {
             if (is_wp_error($post_id)) {
                 $data['wp_error_code'] = $post_id->get_error_code();
                 $data['wp_error_message'] = $post_id->get_error_message();
+                $data['wp_error_data'] = $post_id->get_error_data();
             } else {
                 $data['wp_error_code'] = 'wp_insert_post_returned_0';
                 $data['wp_error_message'] = 'wp_insert_post returned 0 (no WP_Error object)';
@@ -888,9 +1279,6 @@ function herp_create_record(WP_REST_Request $request) {
 
             if (defined('WP_DEBUG') && WP_DEBUG) {
                 $data['current_user_id'] = get_current_user_id();
-                if (is_wp_error($post_id)) {
-                    $data['wp_error_data'] = $post_id->get_error_data();
-                }
                 // DB-level diagnostics for wp_posts insert failures.
                 $data['posts_db_last_error'] = $wpdb->last_error;
                 $data['posts_db_last_query'] = $wpdb->last_query;
@@ -905,6 +1293,78 @@ function herp_create_record(WP_REST_Request $request) {
         }
 
         $post_id = (int) $post_id;
+
+        // Handle uploaded vouchers for this animal (multipart form).
+        $voucher_attachment_ids = [];
+        $voucher_legacy_vids = [];
+        $voucher_upload_errors = [];
+        $file_count = count($uploaded_files);
+        for ($i = 0; $i < $file_count; $i++) {
+            $assigned_idx = isset($assigned_animal_index[$i]) ? intval($assigned_animal_index[$i]) : null;
+            if ($assigned_idx === null || $assigned_idx !== intval($animal_idx)) {
+                continue;
+            }
+
+            $kind = isset($file_kind[$i]) ? (string) $file_kind[$i] : 'image';
+
+            // Insert into legacy voucher table first so we can name the file like production did:
+            // /vouchers/{record_id}-{v_id}.ext
+            $vid = herp_insert_legacy_voucher_row($user_id, $record_id, $kind);
+            if (is_wp_error($vid)) {
+                $voucher_upload_errors[] = [
+                    'file_index' => $i,
+                    'assigned_animal_index' => $assigned_idx,
+                    'file_kind' => $kind,
+                    'error_code' => $vid->get_error_code(),
+                    'error_message' => $vid->get_error_message(),
+                    'error_data' => $vid->get_error_data(),
+                ];
+                continue;
+            }
+
+            $file_for_upload = $uploaded_files[$i];
+            if (is_int($vid) && $vid > 0) {
+                $ext = pathinfo((string) ($file_for_upload['name'] ?? ''), PATHINFO_EXTENSION);
+                $ext = $ext ? ('.' . $ext) : '';
+                $file_for_upload['name'] = $record_id . '-' . $vid . $ext;
+            }
+
+            $attach_id = herp_upload_voucher_to_media($file_for_upload, $post_id, $actor_id ?? null);
+            if (is_wp_error($attach_id)) {
+                $voucher_upload_errors[] = [
+                    'file_index' => $i,
+                    'assigned_animal_index' => $assigned_idx,
+                    'file_kind' => $kind,
+                    'error_code' => $attach_id->get_error_code(),
+                    'error_message' => $attach_id->get_error_message(),
+                    'error_data' => $attach_id->get_error_data(),
+                ];
+                continue;
+            }
+
+            $voucher_attachment_ids[] = (int) $attach_id;
+
+            // Keep track of the legacy voucher id we created (if any).
+            $voucher_legacy_vids[] = is_int($vid) ? $vid : 0;
+        }
+
+        // Mirror website behavior: store voucher attachment IDs in the ACF `vouchers` field.
+        if (!empty($voucher_attachment_ids) && function_exists('update_field') && function_exists('get_field')) {
+            $existing = get_field('vouchers', $post_id);
+            $existing_ids = [];
+            if (is_array($existing)) {
+                foreach ($existing as $ex) {
+                    if (is_array($ex) && !empty($ex['ID'])) {
+                        $existing_ids[] = intval($ex['ID']);
+                    } elseif (is_numeric($ex)) {
+                        $existing_ids[] = intval($ex);
+                    }
+                }
+            }
+
+            $merged = array_values(array_unique(array_merge($existing_ids, $voucher_attachment_ids)));
+            update_field('vouchers', $merged, $post_id);
+        }
 
         // Link DB record -> post.
         $updated = $wpdb->update('record', ['r_post_id' => $post_id], ['r_id' => $record_id]);
@@ -921,19 +1381,52 @@ function herp_create_record(WP_REST_Request $request) {
             wp_set_object_terms($post_id, [$county_id], 'county', false);
         }
 
-        $created[] = [
+        $include_voucher_debug = current_user_can('manage_options') || (defined('WP_DEBUG') && WP_DEBUG);
+
+        $created_item = [
             'record_id' => $record_id,
             'post_id'   => $post_id,
+            'voucher_attachment_ids' => $voucher_attachment_ids,
+            'voucher_legacy_vids' => $voucher_legacy_vids,
         ];
+
+        if ($include_voucher_debug) {
+            $created_item['voucher_received_count'] = $file_count;
+            $created_item['voucher_assigned_animal_index'] = $assigned_animal_index;
+            $created_item['voucher_file_kind'] = $file_kind;
+            $created_item['voucher_upload_errors'] = $voucher_upload_errors;
+        }
+
+        $created[] = $created_item;
     }
 
     if (empty($created)) {
         return new WP_Error('no_records_created', 'No records created (invalid animals payload)', ['status' => 400]);
     }
 
-    return [
+    $herp_buffered_output = (string) ob_get_clean();
+    if (is_callable($prev_error_handler)) {
+        set_error_handler($prev_error_handler);
+    } else {
+        restore_error_handler();
+    }
+    @ini_set('display_errors', (string) $prev_display_errors);
+
+    $response = [
         'success' => true,
         'created' => $created,
     ];
+
+    // Only include diagnostics for admins (or when WP_DEBUG is true).
+    if (current_user_can('manage_options') || (defined('WP_DEBUG') && WP_DEBUG)) {
+        if ($herp_buffered_output !== '') {
+            $response['buffered_output'] = $herp_buffered_output;
+        }
+        if (!empty($herp_warnings)) {
+            $response['warnings'] = $herp_warnings;
+        }
+    }
+
+    return $response;
 }
 

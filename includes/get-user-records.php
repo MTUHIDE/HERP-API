@@ -79,5 +79,110 @@ function herp_get_user_records(WP_REST_Request $request) {
 
     $records = $wpdb->get_results($sql);
 
-    return $records ?: [];
+    $records = $records ?: [];
+
+    // Attach vouchers (ACF field on the WP `record` post).
+    foreach ($records as $record) {
+        $post_id = intval($record->post_id ?? 0);
+        $record->vouchers = herp_get_record_vouchers($post_id);
+    }
+
+    return $records;
+}
+
+/**
+ * Normalize the ACF `vouchers` field into a frontend-friendly payload.
+ *
+ * @return array<int, array<string, mixed>>
+ */
+function herp_get_record_vouchers(int $post_id): array {
+    if ($post_id <= 0) {
+        return [];
+    }
+
+    if (!function_exists('get_field')) {
+        return [];
+    }
+
+    $raw = get_field('vouchers', $post_id);
+    if (empty($raw) || !is_array($raw)) {
+        return [];
+    }
+
+    $out = [];
+
+    foreach ($raw as $voucher) {
+        $attachment_id = 0;
+
+        if (is_numeric($voucher)) {
+            $attachment_id = intval($voucher);
+        } elseif (is_array($voucher)) {
+            $attachment_id = intval($voucher['ID'] ?? $voucher['id'] ?? $voucher['attachment_id'] ?? 0);
+        }
+
+        if ($attachment_id <= 0) {
+            continue;
+        }
+
+        $url = wp_get_attachment_url($attachment_id) ?: '';
+        $mime = get_post_mime_type($attachment_id) ?: '';
+        $type = '';
+        if (is_string($mime) && str_starts_with($mime, 'image/')) {
+            $type = 'image';
+        } elseif (is_string($mime) && str_starts_with($mime, 'audio/')) {
+            $type = 'audio';
+        } else {
+            $type = 'file';
+        }
+
+        $attachment = get_post($attachment_id);
+        $title = $attachment ? (string) $attachment->post_title : '';
+        $caption = $attachment ? (string) $attachment->post_excerpt : '';
+        $description = $attachment ? (string) $attachment->post_content : '';
+
+        $meta = wp_get_attachment_metadata($attachment_id);
+
+        $item = [
+            'id' => $attachment_id,
+            'type' => $type,              // image | audio | file
+            'mime_type' => $mime,
+            'url' => $url,                // full URL
+            'title' => $title,
+            'caption' => $caption,
+            'description' => $description,
+        ];
+
+        if ($type === 'image') {
+            $alt = get_post_meta($attachment_id, '_wp_attachment_image_alt', true);
+            $item['alt'] = is_string($alt) ? $alt : '';
+
+            $full = wp_get_attachment_image_src($attachment_id, 'full');
+            $thumb = wp_get_attachment_image_src($attachment_id, 'thumbnail');
+            $medium = wp_get_attachment_image_src($attachment_id, 'medium');
+            $large = wp_get_attachment_image_src($attachment_id, 'large');
+
+            $item['sizes'] = [
+                'thumbnail' => $thumb ? $thumb[0] : null,
+                'medium' => $medium ? $medium[0] : null,
+                'large' => $large ? $large[0] : null,
+                'full' => $full ? $full[0] : $url,
+            ];
+
+            if (is_array($full)) {
+                $item['width'] = $full[1] ?? null;
+                $item['height'] = $full[2] ?? null;
+            }
+        }
+
+        if ($type === 'audio' && is_array($meta)) {
+            // WP sometimes stores audio duration as length_formatted.
+            if (!empty($meta['length_formatted'])) {
+                $item['length_formatted'] = $meta['length_formatted'];
+            }
+        }
+
+        $out[] = $item;
+    }
+
+    return $out;
 }
