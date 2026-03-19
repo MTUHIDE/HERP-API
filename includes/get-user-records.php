@@ -88,6 +88,36 @@ function herp_get_user_records(WP_REST_Request $request) {
         $record->vouchers = herp_get_record_vouchers($post_id, $record_id);
     }
 
+    // Optional: include user + role payload.
+    // NOTE: This endpoint is currently public; we only include user roles when authenticated
+    // and requesting your own records (or when an admin-like capability is present).
+    $include_user = $request->get_param('include_user');
+    $include_user = ($include_user === true || $include_user === 1 || $include_user === '1' || $include_user === 'true');
+
+    if ($include_user) {
+        $current_user_id = get_current_user_id();
+        $can_view_roles =
+            ($current_user_id > 0) &&
+            (
+                $current_user_id === $user_id ||
+                current_user_can('list_users') ||
+                current_user_can('manage_options')
+            );
+
+        $user_payload = ['id' => $user_id];
+        if ($can_view_roles) {
+            $user = get_userdata($user_id);
+            $roles = ($user && is_array($user->roles ?? null)) ? $user->roles : [];
+            $user_payload['roles'] = array_values($roles);
+            $user_payload['role'] = function_exists('herp_pick_primary_role') ? herp_pick_primary_role($roles) : (($roles[0] ?? null) ?: null);
+        }
+
+        return [
+            'user' => $user_payload,
+            'records' => $records,
+        ];
+    }
+
     return $records;
 }
 

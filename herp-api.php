@@ -10,6 +10,7 @@ if (!defined('ABSPATH')) {
 
 require_once plugin_dir_path(__FILE__) . 'includes/get-user-records.php';
 require_once plugin_dir_path(__FILE__) . 'includes/create-record.php';
+require_once plugin_dir_path(__FILE__) . 'includes/get-current-user.php';
 
 add_action('rest_api_init', function () {
     register_rest_route('herp/v1', '/records', [
@@ -40,5 +41,14 @@ add_action('rest_api_init', function () {
         'methods'             => 'GET',
         'callback'            => 'herp_get_user_records',
         'permission_callback' => '__return_true', // for now, open — secure later!
+    ]);
+
+    // GET /wp-json/herp/v1/me
+    register_rest_route('herp/v1', '/me', [
+        'methods'             => 'GET',
+        'callback'            => 'herp_get_current_user',
+        'permission_callback' => static function () {
+            return is_user_logged_in();
+        },
     ]);
 });
